@@ -454,6 +454,7 @@ class BydDataUpdateCoordinator(DataUpdateCoordinator[VehicleSnapshot]):
         self._fixed_interval = timedelta(seconds=poll_interval)
         self._polling_enabled = True
         self._force_next_refresh = False
+        self._refresh_in_progress = False
         self._car: BydCar | None = None
         self._realtime_endpoint_unsupported: bool = False
         # ``getEnergyConsumption`` returns ``code=1001`` on several VINs
@@ -474,6 +475,9 @@ class BydDataUpdateCoordinator(DataUpdateCoordinator[VehicleSnapshot]):
     @callback
     def _async_handle_state_push(self, snapshot: VehicleSnapshot) -> None:
         """Update from a state-engine push and reset next poll from this update."""
+        if self._refresh_in_progress:
+            return
+
         previous_snapshot = self.data
         self._schedule_hvac_final_reconcile_if_needed(previous_snapshot, snapshot)
 
@@ -661,57 +665,62 @@ class BydDataUpdateCoordinator(DataUpdateCoordinator[VehicleSnapshot]):
 
         car = self._car
 
-        # --- Realtime ---
+        self._refresh_in_progress = True
         try:
-            await car.update_realtime()
-        except _AUTH_ERRORS:
-            raise
-        except BydEndpointNotSupportedError:
-            if not self._realtime_endpoint_unsupported:
-                _LOGGER.warning(
-                    "Realtime HTTP endpoint not supported for vin=%s — "
-                    "will rely on MQTT push (logged once only)",
-                    self._vin,
-                )
-                self._realtime_endpoint_unsupported = True
-        except _RECOVERABLE_ERRORS as exc:
-            _LOGGER.warning(
-                "Realtime fetch failed: vin=%s, error=%s",
-                self._vin,
-                exc,
-            )
-
-        # --- HVAC (conditional) ---
-        if self._should_fetch_hvac(car.state, force=force):
+            # --- Realtime ---
             try:
-                await car.update_hvac()
+                await car.update_realtime()
+            except _AUTH_ERRORS:
+                raise
+            except BydEndpointNotSupportedError:
+                if not self._realtime_endpoint_unsupported:
+                    _LOGGER.warning(
+                        "Realtime HTTP endpoint not supported for vin=%s — "
+                        "will rely on MQTT push (logged once only)",
+                        self._vin,
+                    )
+                    self._realtime_endpoint_unsupported = True
+            except _RECOVERABLE_ERRORS as exc:
+                _LOGGER.warning(
+                    "Realtime fetch failed: vin=%s, error=%s",
+                    self._vin,
+                    exc,
+                )
+
+            # --- HVAC (conditional) ---
+            if self._should_fetch_hvac(car.state, force=force):
+                try:
+                    await car.update_hvac()
+                except _AUTH_ERRORS:
+                    raise
+                except _RECOVERABLE_ERRORS as exc:
+                    _LOGGER.warning(
+                        "HVAC fetch failed: vin=%s, error=%s",
+                        self._vin,
+                        exc,
+                    )
+            else:
+                _LOGGER.debug(
+                    "HVAC fetch skipped: vin=%s, reason=vehicle_not_on",
+                    self._vin[-6:],
+                )
+
+            # --- Charging (Schedule & Live) ---
+            try:
+                await car.update_charging()
             except _AUTH_ERRORS:
                 raise
             except _RECOVERABLE_ERRORS as exc:
                 _LOGGER.warning(
-                    "HVAC fetch failed: vin=%s, error=%s",
+                    "Charging fetch failed: vin=%s, error=%s",
                     self._vin,
                     exc,
                 )
-        else:
-            _LOGGER.debug(
-                "HVAC fetch skipped: vin=%s, reason=vehicle_not_on",
-                self._vin[-6:],
-            )
 
-        # --- Charging (Schedule & Live) ---
-        try:
-            await car.update_charging()
-        except _AUTH_ERRORS:
-            raise
-        except _RECOVERABLE_ERRORS as exc:
-            _LOGGER.warning(
-                "Charging fetch failed: vin=%s, error=%s",
-                self._vin,
-                exc,
-            )
+            snapshot = car.state
+        finally:
+            self._refresh_in_progress = False
 
-        snapshot = car.state
         self._schedule_hvac_final_reconcile_if_needed(previous_snapshot, snapshot)
 
         # Bail if we still have no realtime data at all
